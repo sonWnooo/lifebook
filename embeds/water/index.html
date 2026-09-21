@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js webgpu - compute water</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<link type="text/css" rel="stylesheet" href="example.css">
+		<script>
+			// 嵌入模式（?embed=1）：隐藏信息栏与 inspector 面板，只留全屏画面
+			if ( new URLSearchParams( location.search ).has( 'embed' ) ) {
+
+				document.documentElement.classList.add( 'embed' );
+
+			}
+		</script>
+	</head>
+	<body>
+
+		<div id="info">
+			<a href="https://threejs.org/" target="_blank" rel="noopener" class="logo-link"></a>
+
+			<div class="title-wrapper">
+				<a href="https://threejs.org/" target="_blank" rel="noopener">three.js</a>
+				<span>Compute Water</span>
+			</div>
+
+			<small>
+				Move the mouse — the little red fish swims and stirs the water. Click once to enable the water sound.
+			</small>
+		</div>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "./lib/three.webgpu.js",
+					"three/webgpu": "./lib/three.webgpu.js",
+					"three/tsl": "./lib/three.tsl.js",
+					"three/addons/": "./lib/jsm/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three/webgpu';
+			import { instanceIndex, struct, If, uint, int, floor, float, length, clamp, vec2, cos, vec3, vertexIndex, Fn, uniform, instancedArray, min, max, positionLocal, transformNormalToView, select, globalId, mix, smoothstep, time, screenUV, pass } from 'three/tsl';
+
+			import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+
+			import { Inspector } from 'three/addons/inspector/Inspector.js';
+
+			import { SimplexNoise } from 'three/addons/math/SimplexNoise.js';
+			import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+			import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+			import { DRACOLoader, DRACO_GLTF_CONFIG } from 'three/addons/loaders/DRACOLoader.js';
+
+			import WebGPU from 'three/addons/capabilities/WebGPU.js';
+
+			// Dimensions of simulation grid.
+			const WIDTH = 384;
+
+			// Water size in system units (fills the whole canvas).
+			const BOUNDS = 12;
+			const BOUNDS_HALF = BOUNDS * 0.5;
+			const limit = BOUNDS_HALF - 0.2;
+
+			const waterMaxHeight = 0.1;
+
+			let container;
+			let camera, scene, renderer;
+
+			const mouseCoords = new THREE.Vector2();
+			const raycaster = new THREE.Raycaster();
+			let frame = 0;
+
+			const effectController = {
+				mousePos: uniform( new THREE.Vector2() ).setName( 'mousePos' ),
+				mouseSpeed: uniform( new THREE.Vector2() ).setName( 'mouseSpeed' ),
+				fish2Pos: uniform( new THREE.Vector2() ).setName( 'fish2Pos' ),
+				fish2Speed: uniform( new THREE.Vector2() ).setName( 'fish2Speed' ),
+				mouseDeep: uniform( .5 ).setName( 'mouseDeep' ),
+				mouseSize: uniform( 0.12 ).setName( 'mouseSize' ),
+				viscosity: uniform( 0.96 ).setName( 'viscosity' ),
+				ducksEnabled: true,
+				wireframe: false,
+				speed: 5,
+			};
+
+			let sun;
+			let waterMesh;
+			let meshRay;
+			let fish, fishTail, fish2, fishTail2;
+			let computeHeightAtoB, computeHeightBtoA, computeDucks;
+			let postProcessing;
+			let pingPong = 0;
+			const readFromA = uniform( 1 );
+			let duckModel = null;
+
+			const fishPos = new THREE.Vector3();
+			const fishTarget = new THREE.Vector3();
+			let fishHeading = 0;
+			const fish2Pos = new THREE.Vector3();
+			let fish2Heading = 0;
+
+			// Swimming water sound: looping bubble recording, volume/rate follow the fish speed
+			let audioCtx = null, swimGain = null, swimPanner = null, swimSource = null;
+
+			const NUM_DUCKS = 250;
+			const DUCK_SCALE = 1.8;
+
+			const simplex = new SimplexNoise();
+
+			if ( WebGPU.isAvailable() === false ) {
+
+				document.body.appendChild( WebGPU.getErrorMessage() );
+
+				throw new Error( 'No WebGPU support' );
+
+			}
+
+			init();
+
+			function noise( x, y ) {
+
+				let multR = waterMaxHeight;
+				let mult = 0.025;
+				let r = 0;
+				for ( let i = 0; i < 15; i ++ ) {
+
+					r += multR * simplex.noise( x * mult, y * mult );
+					multR *= 0.53 + 0.025 * i;
+					mult *= 1.25;
+
+				}
+
+				return r;
+
+			}
+
+			function createFish( bodyColor, finColor, scale ) {
+
+				const group = new THREE.Group();
+
+				const body = new THREE.MeshPhysicalMaterial( { color: bodyColor, roughness: 0.38, metalness: 0.08, clearcoat: 1.0, clearcoatRoughness: 0.18 } );
+				const fin = new THREE.MeshPhysicalMaterial( { color: finColor, roughness: 0.5, metalness: 0.0, clearcoat: 0.5, clearcoatRoughness: 0.4, side: THREE.DoubleSide } );
+				const black = new THREE.MeshStandardMaterial( { color: 0x0b0b0e, roughness: 0.25 } );
+
+				// countershading: dark back fading to a pale belly, like real fish
+				const back = new THREE.Color( bodyColor ).multiplyScalar( 0.55 );
+				const belly = new THREE.Color( bodyColor ).lerp( new THREE.Color( 0xffffff ), 0.45 );
+				body.colorNode = Fn( () => {
+
+					return mix( belly, back, smoothstep( - 0.10, 0.10, positionLocal.y ) );
+
+				} )();
+
+				// body (head toward +X)
+				const bodyGeo = new THREE.SphereGeometry( 0.16, 24, 16 );
+				bodyGeo.scale( 1.5, 0.85, 0.6 );
+				group.add( new THREE.Mesh( bodyGeo, body ) );
+
+				// tail fin, pivoting at the body rear
+				const tailGeo = new THREE.ConeGeometry( 0.1, 0.24, 12 );
+				tailGeo.rotateZ( - Math.PI / 2 );
+				tailGeo.scale( 1, 1, 0.3 );
+				tailGeo.translate( - 0.12, 0, 0 );
+				const tail = new THREE.Group();
+				tail.position.x = - 0.2;
+				tail.add( new THREE.Mesh( tailGeo, fin ) );
+				group.add( tail );
+				group.userData.tail = tail;
+
+				// dorsal fin
+				const dorsal = new THREE.Mesh( new THREE.ConeGeometry( 0.05, 0.12, 8 ), fin );
+				dorsal.position.set( - 0.02, 0.15, 0 );
+				group.add( dorsal );
+
+				// eyes
+				for ( const side of [ - 1, 1 ] ) {
+
+					const eye = new THREE.Mesh( new THREE.SphereGeometry( 0.022, 10, 8 ), black );
+					eye.position.set( 0.15, 0.045, side * 0.08 );
+					group.add( eye );
+
+				}
+
+				group.scale.setScalar( scale );
+				group.traverse( ( o ) => ( o.castShadow = true ) );
+				return group;
+
+			}
+
+			async function init() {
+
+				container = document.createElement( 'div' );
+				document.body.appendChild( container );
+
+				camera = new THREE.PerspectiveCamera( 75, window.innerWidth / window.innerHeight, 1, 3000 );
+				// fixed vertical top-down view; height fits the pool to the full canvas
+				fitCameraToPool();
+				window.addEventListener( 'resize', () => fitCameraToPool() );
+
+				scene = new THREE.Scene();
+
+				sun = new THREE.DirectionalLight( 0xfff1dd, 3.2 );
+				sun.position.set( - 1, 2.6, 1.4 );
+				sun.castShadow = true;
+				sun.shadow.mapSize.set( 2048, 2048 );
+				sun.shadow.camera.left = - 8;
+				sun.shadow.camera.right = 8;
+				sun.shadow.camera.top = 8;
+				sun.shadow.camera.bottom = - 8;
+				sun.shadow.camera.near = 0.5;
+				sun.shadow.camera.far = 20;
+				sun.shadow.bias = - 0.0002;
+				scene.add( sun );
+
+				// cool fill from the opposite side keeps the palette deep, not flat
+				const fill = new THREE.HemisphereLight( 0x6fa8c9, 0x071622, 0.7 );
+				scene.add( fill );
+
+				//
+
+				// Initialize height storage buffers
+				const heightArray = new Float32Array( WIDTH * WIDTH );
+				const prevHeightArray = new Float32Array( WIDTH * WIDTH );
+
+				let p = 0;
+				for ( let j = 0; j < WIDTH; j ++ ) {
+
+					for ( let i = 0; i < WIDTH; i ++ ) {
+
+						const x = i * 128 / WIDTH;
+						const y = j * 128 / WIDTH;
+
+						const height = noise( x, y );
+
+						heightArray[ p ] = height;
+						prevHeightArray[ p ] = height;
+
+						p ++;
+
+					}
+
+				}
+
+				// Ping-pong height storage buffers
+				const heightStorageA = instancedArray( heightArray ).setName( 'HeightA' );
+				const heightStorageB = instancedArray( new Float32Array( heightArray ) ).setName( 'HeightB' );
+				const prevHeightStorage = instancedArray( prevHeightArray ).setName( 'PrevHeight' );
+
+				// Get Indices of Neighbor Values of an Index in the Simulation Grid
+				const getNeighborIndicesTSL = ( index ) => {
+
+					const width = uint( WIDTH );
+
+					const x = int( index.mod( WIDTH ) );
+					const y = int( index.div( WIDTH ) );
+
+					const leftX = max( 0, x.sub( 1 ) );
+					const rightX = min( x.add( 1 ), width.sub( 1 ) );
+
+					const bottomY = max( 0, y.sub( 1 ) );
+					const topY = min( y.add( 1 ), width.sub( 1 ) );
+
+					const westIndex = y.mul( width ).add( leftX );
+					const eastIndex = y.mul( width ).add( rightX );
+
+					const southIndex = bottomY.mul( width ).add( x );
+					const northIndex = topY.mul( width ).add( x );
+
+					return { northIndex, southIndex, eastIndex, westIndex };
+
+				};
+
+				// Get simulation index neighbor values
+				const getNeighborValuesTSL = ( index, store ) => {
+
+					const { northIndex, southIndex, eastIndex, westIndex } = getNeighborIndicesTSL( index );
+
+					const north = store.element( northIndex );
+					const south = store.element( southIndex );
+					const east = store.element( eastIndex );
+					const west = store.element( westIndex );
+
+					return { north, south, east, west };
+
+				};
+
+				// Create compute shader for height simulation with explicit read/write buffers
+				const createComputeHeight = ( readBuffer, writeBuffer ) => Fn( () => {
+
+					const { viscosity, mousePos, mouseSize, mouseDeep, mouseSpeed, fish2Pos, fish2Speed } = effectController;
+
+					const height = readBuffer.element( instanceIndex ).toVar();
+					const prevHeight = prevHeightStorage.element( instanceIndex ).toVar();
+
+					const { north, south, east, west } = getNeighborValuesTSL( instanceIndex, readBuffer );
+
+					const neighborHeight = north.add( south ).add( east ).add( west );
+					neighborHeight.mulAssign( 0.5 );
+					neighborHeight.subAssign( prevHeight );
+
+					const newHeight = neighborHeight.mul( viscosity );
+
+					// Get x and y position of the coordinate in the water plane
+
+					const x = float( globalId.x ).mul( 1 / WIDTH );
+					const y = float( globalId.y ).mul( 1 / WIDTH );
+
+					// Mouse influence
+					const centerVec = vec2( 0.5 );
+
+					const mousePhase = clamp( length( ( vec2( x, y ).sub( centerVec ) ).mul( BOUNDS ).sub( mousePos ) ).mul( Math.PI ).div( mouseSize ), 0.0, Math.PI );
+
+					// "Indent" water down by scaled distance from center of mouse impact
+					newHeight.addAssign( cos( mousePhase ).add( 1.0 ).mul( mouseDeep ).mul( mouseSpeed.length() ) );
+
+					// Second disturbance: the wake of the big chasing fish
+					const chasePhase = clamp( length( ( vec2( x, y ).sub( centerVec ) ).mul( BOUNDS ).sub( fish2Pos ) ).mul( Math.PI ).div( 0.18 ), 0.0, Math.PI );
+					newHeight.addAssign( cos( chasePhase ).add( 1.0 ).mul( 0.35 ).mul( fish2Speed.length() ) );
+
+					prevHeightStorage.element( instanceIndex ).assign( height );
+					writeBuffer.element( instanceIndex ).assign( newHeight );
+
+				} )().compute( WIDTH * WIDTH, [ 16, 16 ] );
+
+				// Create both ping-pong compute shaders
+				computeHeightAtoB = createComputeHeight( heightStorageA, heightStorageB ).setName( 'Update Height A→B' );
+				computeHeightBtoA = createComputeHeight( heightStorageB, heightStorageA ).setName( 'Update Height B→A' );
+
+				// Water Geometry corresponds with buffered compute grid.
+				const waterGeometry = new THREE.PlaneGeometry( BOUNDS, BOUNDS, WIDTH - 1, WIDTH - 1 );
+
+				const waterMaterial = new THREE.MeshStandardNodeMaterial( {
+					color: 0xffffff,
+					metalness: 0.12,
+					roughness: 0.07,
+					side: THREE.DoubleSide
+				} );
+
+				// Helper to get height from the current read buffer
+				const getCurrentHeight = ( index ) => {
+
+					return select( readFromA, heightStorageA.element( index ), heightStorageB.element( index ) );
+
+				};
+
+				// Helper to get normals from the current read buffer
+				const getCurrentNormals = ( index ) => {
+
+					const { northIndex, southIndex, eastIndex, westIndex } = getNeighborIndicesTSL( index );
+
+					const north = getCurrentHeight( northIndex );
+					const south = getCurrentHeight( southIndex );
+					const east = getCurrentHeight( eastIndex );
+					const west = getCurrentHeight( westIndex );
+
+					const normalX = ( west.sub( east ) ).mul( WIDTH / BOUNDS );
+					const normalY = ( south.sub( north ) ).mul( WIDTH / BOUNDS );
+
+					return { normalX, normalY };
+
+				};
+
+				waterMaterial.normalNode = Fn( () => {
+
+					const { normalX, normalY } = getCurrentNormals( vertexIndex );
+
+					// fine traveling ripples so the surface glints even when calm
+					const rx = cos( positionLocal.x.mul( 16 ).add( time.mul( 2.4 ) ) ).mul( 0.020 )
+						.add( cos( positionLocal.y.mul( 27 ).sub( time.mul( 1.6 ) ) ).mul( 0.012 ) );
+					const ry = cos( positionLocal.y.mul( 19 ).add( time.mul( 2.0 ) ) ).mul( 0.020 )
+						.add( cos( positionLocal.x.mul( 23 ).add( time.mul( 1.3 ) ).add( 2.1 ) ).mul( 0.012 ) );
+
+					return transformNormalToView( vec3( normalX.add( rx ), normalY.add( ry ).negate(), 1.0 ) ).toVertexStage();
+
+				} )();
+
+				// deep-water shading: dark basin below, teal crests above
+				waterMaterial.colorNode = Fn( () => {
+
+					const h = getCurrentHeight( vertexIndex );
+
+					const deep = vec3( 0.018, 0.075, 0.150 );
+					const mid = vec3( 0.030, 0.200, 0.310 );
+					const crest = vec3( 0.100, 0.460, 0.600 );
+
+					return mix( deep, mid, smoothstep( - 0.06, 0.08, h ) )
+						.add( crest.mul( smoothstep( 0.035, 0.11, h ) ) );
+
+				} )();
+
+				// wave crests get slightly rougher, troughs stay mirror-like
+				waterMaterial.roughnessNode = float( 0.05 ).add( smoothstep( 0.0, 0.12, getCurrentHeight( vertexIndex ) ).mul( 0.10 ) );
+
+				waterMaterial.positionNode = Fn( () => {
+
+					return vec3( positionLocal.x, positionLocal.y, getCurrentHeight( vertexIndex ) );
+
+				} )();
+
+				waterMesh = new THREE.Mesh( waterGeometry, waterMaterial );
+				waterMesh.rotation.x = - Math.PI * 0.5;
+				waterMesh.matrixAutoUpdate = false;
+				waterMesh.updateMatrix();
+				waterMesh.receiveShadow = true;
+
+				scene.add( waterMesh );
+
+				// THREE.Mesh just for fish raycasting
+				const geometryRay = new THREE.PlaneGeometry( BOUNDS, BOUNDS, 1, 1 );
+				meshRay = new THREE.Mesh( geometryRay, new THREE.MeshBasicMaterial( { color: 0xFFFFFF, visible: false } ) );
+				meshRay.rotation.x = - Math.PI / 2;
+				meshRay.matrixAutoUpdate = false;
+				meshRay.updateMatrix();
+				scene.add( meshRay );
+
+				// Little red fish that follows the mouse and stirs the water
+				fish = createFish( 0xe2312f, 0xc22422, 1.3 );
+				scene.add( fish );
+				fishTail = fish.userData.tail;
+
+				// Bigger dark-red fish chasing the little one
+				fish2 = createFish( 0x7a1210, 0x5c0d0b, 2.1 );
+				scene.add( fish2 );
+				fishTail2 = fish2.userData.tail;
+
+				// Initialize duck instance position and velocity.
+				// position<vec3> + velocity<vec2> + unused<vec3> = 8 floats per duck.
+				// for structs arrays must be enclosed in multiple of 4
+
+				const duckStride = 8;
+				const duckInstanceDataArray = new Float32Array( NUM_DUCKS * duckStride );
+
+				for ( let i = 0; i < NUM_DUCKS; i ++ ) {
+
+					duckInstanceDataArray[ i * duckStride + 0 ] = ( Math.random() - 0.5 ) * BOUNDS * 0.78;
+					duckInstanceDataArray[ i * duckStride + 1 ] = 0;
+					duckInstanceDataArray[ i * duckStride + 2 ] = ( Math.random() - 0.5 ) * BOUNDS * 0.78;
+
+				}
+
+				const DuckStruct = struct( {
+					position: 'vec3',
+					velocity: 'vec2'
+				} );
+
+				const duckInstanceDataStorage = instancedArray( duckInstanceDataArray, DuckStruct ).setName( 'DuckInstanceData' );
+
+				computeDucks = Fn( () => {
+
+					const yOffset = float( - 0.04 );
+					const verticalResponseFactor = float( 0.98 );
+					const waterPushFactor = float( 0.015 );
+					const linearDamping = float( 0.92 );
+					const bounceDamping = float( - 0.4 );
+
+					const instancePosition = duckInstanceDataStorage.element( instanceIndex ).get( 'position' ).toVar();
+					const velocity = duckInstanceDataStorage.element( instanceIndex ).get( 'velocity' ).toVar();
+
+					const gridCoordX = instancePosition.x.div( BOUNDS ).add( 0.5 ).mul( WIDTH );
+					const gridCoordZ = instancePosition.z.div( BOUNDS ).add( 0.5 ).mul( WIDTH );
+
+					const xCoord = uint( clamp( floor( gridCoordX ), 0, WIDTH - 1 ) );
+					const zCoord = uint( clamp( floor( gridCoordZ ), 0, WIDTH - 1 ) );
+					const heightInstanceIndex = zCoord.mul( WIDTH ).add( xCoord );
+
+					const waterHeight = getCurrentHeight( heightInstanceIndex );
+					const { normalX, normalY } = getCurrentNormals( heightInstanceIndex );
+
+					const targetY = waterHeight.add( yOffset );
+
+					const deltaY = targetY.sub( instancePosition.y );
+					instancePosition.y.addAssign( deltaY.mul( verticalResponseFactor ) );
+
+					const pushX = normalX.mul( waterPushFactor );
+					const pushZ = normalY.mul( waterPushFactor );
+
+					velocity.x.mulAssign( linearDamping );
+					velocity.y.mulAssign( linearDamping );
+
+					velocity.x.addAssign( pushX );
+					velocity.y.addAssign( pushZ );
+
+					instancePosition.x.addAssign( velocity.x );
+					instancePosition.z.addAssign( velocity.y );
+
+					If( instancePosition.x.lessThan( - limit ), () => {
+
+						instancePosition.x = - limit;
+						velocity.x.mulAssign( bounceDamping );
+
+					} ).ElseIf( instancePosition.x.greaterThan( limit ), () => {
+
+						instancePosition.x = limit;
+						velocity.x.mulAssign( bounceDamping );
+
+					} );
+
+					If( instancePosition.z.lessThan( - limit ), () => {
+
+						instancePosition.z = - limit;
+						velocity.y.mulAssign( bounceDamping );
+
+					} ).ElseIf( instancePosition.z.greaterThan( limit ), () => {
+
+						instancePosition.z = limit;
+						velocity.y.mulAssign( bounceDamping );
+
+					} );
+
+					duckInstanceDataStorage.element( instanceIndex ).get( 'position' ).assign( instancePosition );
+					duckInstanceDataStorage.element( instanceIndex ).get( 'velocity' ).assign( velocity );
+
+				} )().compute( NUM_DUCKS ).setName( 'Update Ducks' );
+
+				// Models / Textures
+
+				const hdrLoader = new HDRLoader().setPath( './textures/equirectangular/' );
+				const glbloader = new GLTFLoader().setPath( 'models/gltf/' );
+				glbloader.setDRACOLoader( new DRACOLoader().setDecoderPath( DRACO_GLTF_CONFIG ) );
+
+				const [ env, model ] = await Promise.all( [ hdrLoader.loadAsync( 'blouberg_sunrise_2_1k.hdr' ), glbloader.loadAsync( 'duck.glb' ) ] );
+				env.mapping = THREE.EquirectangularReflectionMapping;
+				// HDR stays as reflections only; the visible backdrop is a deep gradient
+				scene.environment = env;
+				scene.environmentIntensity = 0.9;
+				scene.backgroundNode = Fn( () => {
+
+					return mix( vec3( 0.010, 0.022, 0.045 ), vec3( 0.043, 0.110, 0.196 ), screenUV.y.oneMinus() );
+
+				} )();
+
+				duckModel = model.scene.children[ 0 ];
+				// wet-plastic look: clearcoat over a matte duck body
+				const oldDuckMaterial = duckModel.material;
+				duckModel.material = new THREE.MeshPhysicalMaterial( {
+					map: oldDuckMaterial.map || null,
+					color: oldDuckMaterial.color.clone(),
+					roughness: 0.42,
+					metalness: 0.0,
+					clearcoat: 0.7,
+					clearcoatRoughness: 0.25
+				} );
+				duckModel.material.positionNode = Fn( () => {
+
+					const instancePosition = duckInstanceDataStorage.element( instanceIndex ).get( 'position' );
+
+					// mesh is scaled by DUCK_SCALE; keep instance positions in world units
+					const newPosition = positionLocal.add( instancePosition.div( DUCK_SCALE ) );
+
+					return newPosition;
+
+				} )();
+
+				const duckMesh = new THREE.InstancedMesh( duckModel.geometry, duckModel.material, NUM_DUCKS );
+				duckMesh.scale.setScalar( DUCK_SCALE );
+				duckMesh.castShadow = true;
+				scene.add( duckMesh );
+
+				renderer = new THREE.WebGPURenderer( { antialias: true, requiredLimits: { maxStorageBuffersInVertexStage: 2 } } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.toneMapping = THREE.ACESFilmicToneMapping;
+				renderer.toneMappingExposure = 0.85;
+				renderer.shadowMap.enabled = true;
+				renderer.setAnimationLoop( render );
+				container.appendChild( renderer.domElement );
+
+				// bloom so highlights bleed light the way game CG does
+				postProcessing = new THREE.PostProcessing( renderer );
+				const sceneColor = pass( scene, camera ).getTextureNode();
+				postProcessing.outputNode = sceneColor.add( bloom( sceneColor, 0.32, 0.4, 0.88 ) );
+
+				renderer.inspector = new Inspector();
+				document.body.appendChild( renderer.inspector.domElement );
+
+				//
+
+				container.style.touchAction = 'none';
+				container.addEventListener( 'pointermove', onPointerMove );
+				container.addEventListener( 'pointerdown', unlockAudio );
+
+				window.addEventListener( 'keydown', unlockAudio );
+
+				window.addEventListener( 'resize', onWindowResize );
+
+				// GUI
+
+				const gui = renderer.inspector.createParameters( 'Settings' );
+				gui.add( effectController.mouseSize, 'value', 0.1, .3 ).name( 'Fish Size' );
+				gui.add( effectController.mouseDeep, 'value', 0.1, 1 ).name( 'Fish Deep' );
+				gui.add( effectController.viscosity, 'value', 0.9, 0.96, 0.001 ).name( 'viscosity' );
+				gui.add( effectController, 'speed', 1, 6, 1 );
+				gui.add( effectController, 'ducksEnabled' ).onChange( () => {
+
+					duckMesh.visible = effectController.ducksEnabled;
+
+				} );
+				gui.add( effectController, 'wireframe' ).onChange( () => {
+
+					waterMesh.material.wireframe = ! waterMesh.material.wireframe;
+					duckModel.material.wireframe = ! duckModel.material.wireframe;
+					waterMesh.material.needsUpdate = true;
+
+				} );
+
+			}
+
+			// raise the camera just enough that the square pool covers the whole
+			// viewport at any aspect ratio (portrait included)
+			function fitCameraToPool() {
+
+				const vFov = THREE.MathUtils.degToRad( camera.fov );
+				const halfTangent = Math.tan( vFov / 2 );
+				const half = BOUNDS / 2;
+				const aspect = Math.max( window.innerWidth / window.innerHeight, 0.0001 );
+
+				const distanceV = half / halfTangent;
+				const distanceH = half / ( halfTangent * aspect );
+
+				// the viewport must sit *inside* the pool square, so the camera
+				// goes to the SMALLER of the two distances and the pool
+				// overflows past every edge — water fills the whole canvas
+				camera.position.set( 0, Math.min( distanceV, distanceH ) * 0.97 + 0.0001, 0.0001 );
+				camera.lookAt( 0, 0, 0 );
+				camera.updateProjectionMatrix();
+
+			}
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				fitCameraToPool();
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			function setMouseCoords( x, y ) {
+
+				mouseCoords.set( ( x / renderer.domElement.clientWidth ) * 2 - 1, - ( y / renderer.domElement.clientHeight ) * 2 + 1 );
+
+			}
+
+			function onPointerMove( event ) {
+
+				if ( event.isPrimary === false ) return;
+
+				setMouseCoords( event.clientX, event.clientY );
+
+			}
+
+			function initAudio() {
+
+				if ( audioCtx ) return;
+
+				const AC = window.AudioContext || window.webkitAudioContext;
+				if ( ! AC ) return;
+
+				audioCtx = new AC();
+
+				swimGain = audioCtx.createGain();
+				swimGain.gain.value = 0;
+
+				swimPanner = audioCtx.createStereoPanner ? audioCtx.createStereoPanner() : null;
+
+				if ( swimPanner ) {
+
+					swimGain.connect( swimPanner );
+					swimPanner.connect( audioCtx.destination );
+
+				} else {
+
+					swimGain.connect( audioCtx.destination );
+
+				}
+
+				// Load both bubble recordings, then assemble a long seamless loop
+				// out of randomly shuffled granules so it never audibly repeats
+				Promise.all( [
+					fetch( 'sounds/bubble.wav' ).then( res => res.arrayBuffer() ),
+					fetch( 'sounds/bubble2.wav' ).then( res => res.arrayBuffer() )
+				] )
+					.then( ( [ rawA, rawB ] ) => Promise.all( [ audioCtx.decodeAudioData( rawA ), audioCtx.decodeAudioData( rawB ) ] ) )
+					.then( ( [ clipA, clipB ] ) => {
+
+						const loopBuffer = buildSwimLoop( audioCtx, [ clipA, clipB ] );
+
+						swimSource = audioCtx.createBufferSource();
+						swimSource.buffer = loopBuffer;
+						swimSource.loop = true;
+						swimSource.connect( swimGain );
+						swimSource.start();
+
+						// small state handle for debugging: window.__swimAudio()
+						window.__swimAudio = () => ( {
+							state: audioCtx.state,
+							gain: swimGain.gain.value,
+							rate: swimSource.playbackRate.value,
+							loopSeconds: Math.round( loopBuffer.duration )
+						} );
+
+					} )
+					.catch( err => console.warn( 'Swim sound failed to load:', err ) );
+
+			}
+
+			// Reassembles the clips into a ~24s stereo loop: random granules with
+			// hann-window 50% overlap-add, independent shuffle per channel, peak-normalized.
+			// The loop period is far longer than a typical mouse run, so repetition is inaudible.
+			function buildSwimLoop( ctx, clips ) {
+
+				const sr = ctx.sampleRate;
+				const targetSeconds = 24;
+				const length = Math.floor( targetSeconds * sr );
+				const loop = ctx.createBuffer( 2, length, sr );
+
+				for ( let ch = 0; ch < 2; ch ++ ) {
+
+					const dst = loop.getChannelData( ch );
+					let pos = 0;
+
+					while ( pos < length ) {
+
+						// weighted pick: clipB (longer bed) is more likely than clipA
+						const clip = Math.random() < 0.35 ? clips[ 0 ] : clips[ 1 ];
+						const src = clip.getChannelData( ch );
+
+						const grainLen = Math.floor( ( 0.18 + Math.random() * 0.17 ) * sr );
+						const start = Math.floor( Math.random() * Math.max( 1, src.length - grainLen ) );
+
+						for ( let i = 0; i < grainLen && pos + i < length; i ++ ) {
+
+							const w = 0.5 - 0.5 * Math.cos( 2 * Math.PI * i / ( grainLen - 1 ) );
+							dst[ pos + i ] += src[ start + i ] * w;
+
+						}
+
+						pos += Math.floor( grainLen * 0.5 );
+
+					}
+
+				}
+
+				let peak = 0;
+				for ( let ch = 0; ch < 2; ch ++ ) {
+
+					const d = loop.getChannelData( ch );
+					for ( let i = 0; i < d.length; i ++ ) peak = Math.max( peak, Math.abs( d[ i ] ) );
+
+				}
+
+				if ( peak > 0 ) {
+
+					const g = 0.9 / peak;
+					for ( let ch = 0; ch < 2; ch ++ ) {
+
+						const d = loop.getChannelData( ch );
+						for ( let i = 0; i < d.length; i ++ ) d[ i ] *= g;
+
+					}
+
+				}
+
+				return loop;
+
+			}
+
+			function updateSwimSound( speed, pan ) {
+
+				if ( ! audioCtx || audioCtx.state !== 'running' || ! swimSource ) return;
+
+				const t = audioCtx.currentTime;
+				const s = Math.min( speed / 0.45, 1 );
+
+				// slow wandering detune keeps the loop from sounding mechanical
+				const drift = Math.sin( t * 0.7 ) * 0.05 + Math.sin( t * 1.9 ) * 0.03;
+
+				swimGain.gain.setTargetAtTime( s * 0.8, t, 0.08 );
+				swimSource.playbackRate.setTargetAtTime( 0.85 + s * 0.5 + drift, t, 0.15 );
+
+				if ( swimPanner ) swimPanner.pan.setTargetAtTime( Math.max( - 1, Math.min( 1, pan ) ) * 0.7, t, 0.15 );
+
+			}
+
+			function unlockAudio() {
+
+				initAudio();
+
+				if ( audioCtx && audioCtx.state === 'suspended' ) audioCtx.resume();
+
+			}
+
+			function updateFish() {
+
+				// Aim the fish at the pointer position on the water
+				raycaster.setFromCamera( mouseCoords, camera );
+
+				const intersects = raycaster.intersectObject( meshRay );
+
+				if ( intersects.length > 0 ) {
+
+					fishTarget.copy( intersects[ 0 ].point );
+					fishTarget.x = Math.max( - limit, Math.min( limit, fishTarget.x ) );
+					fishTarget.z = Math.max( - limit, Math.min( limit, fishTarget.z ) );
+
+				}
+
+				const oldX = fishPos.x;
+				const oldZ = fishPos.z;
+
+				fishPos.lerp( fishTarget, 0.18 );
+
+				const vx = fishPos.x - oldX;
+				const vz = fishPos.z - oldZ;
+
+				// The fish stirs the water exactly where it swims
+				effectController.mousePos.value.set( fishPos.x, fishPos.z );
+				effectController.mouseSpeed.value.set( vx, vz );
+
+				const t = performance.now() * 0.001;
+				fish.position.set( fishPos.x, 0.03 + Math.sin( t * 3 ) * 0.012, fishPos.z );
+
+				if ( vx * vx + vz * vz > 0.000001 ) {
+
+					const heading = Math.atan2( - vz, vx );
+					let delta = heading - fishHeading;
+					while ( delta > Math.PI ) delta -= Math.PI * 2;
+					while ( delta < - Math.PI ) delta += Math.PI * 2;
+					fishHeading += delta * 0.35;
+					fish.rotation.y = fishHeading;
+
+				}
+
+				const speed = Math.min( Math.hypot( vx, vz ) * 8, 0.45 );
+				fishTail.rotation.y = Math.sin( t * 14 ) * ( 0.2 + speed );
+
+				// Swimming water sound follows the little fish's speed and position
+				updateSwimSound( speed, fishPos.x / limit );
+
+				// Big dark-red fish chasing the little one (fast, staying right on its tail)
+				const oldX2 = fish2Pos.x;
+				const oldZ2 = fish2Pos.z;
+
+				fish2Pos.lerp( fishPos, 0.055 );
+
+				const vx2 = fish2Pos.x - oldX2;
+				const vz2 = fish2Pos.z - oldZ2;
+
+				effectController.fish2Pos.value.set( fish2Pos.x, fish2Pos.z );
+				effectController.fish2Speed.value.set( vx2, vz2 );
+
+				fish2.position.set( fish2Pos.x, 0.04 + Math.sin( t * 2.4 + 1.3 ) * 0.014, fish2Pos.z );
+
+				if ( vx2 * vx2 + vz2 * vz2 > 0.000001 ) {
+
+					const heading2 = Math.atan2( - vz2, vx2 );
+					let delta2 = heading2 - fish2Heading;
+					while ( delta2 > Math.PI ) delta2 -= Math.PI * 2;
+					while ( delta2 < - Math.PI ) delta2 += Math.PI * 2;
+					fish2Heading += delta2 * 0.22;
+					fish2.rotation.y = fish2Heading;
+
+				}
+
+				const speed2 = Math.min( Math.hypot( vx2, vz2 ) * 8, 0.45 );
+				fishTail2.rotation.y = Math.sin( t * 10 ) * ( 0.2 + speed2 );
+
+			}
+
+			function render() {
+
+				updateFish();
+
+				frame ++;
+
+				if ( frame >= 7 - effectController.speed ) {
+
+					// Ping-pong: alternate which buffer we read from and write to
+					if ( pingPong === 0 ) {
+
+						renderer.compute( computeHeightAtoB, [ 24, 24, 1 ] );
+						readFromA.value = 0; // Material now reads from B (just written)
+
+					} else {
+
+						renderer.compute( computeHeightBtoA, [ 24, 24, 1 ] );
+						readFromA.value = 1; // Material now reads from A (just written)
+
+					}
+
+					pingPong = 1 - pingPong;
+
+					if ( effectController.ducksEnabled ) {
+
+						renderer.compute( computeDucks );
+
+					}
+
+					frame = 0;
+
+				}
+
+				postProcessing.render();
+
+			}
+
+		</script>
+	</body>
+</html>
